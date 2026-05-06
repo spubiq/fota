@@ -1,0 +1,6 @@
+{
+  "version": "v1.0.1",
+  "url": "https://CHANGE-ME.netlify.app/firmware.bin",
+  "released_at": "2026-05-04",
+  "notes": "Initial FOTA test release"
+}

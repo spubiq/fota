@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Moldrix FOTA Dashboard — MQTT Control Plane</title>
+<!--
+  Architecture:
+    Browser (this file)  ──ws://broker:15675/ws──▶  RabbitMQ MQTT broker
+    RabbitMQ broker      ──tcp://broker:1883──▶     ESP32-C3 device(s)
+    Devices publish       device/{id}/status       (heartbeats)
+    Devices publish       device/{id}/ota/status   (OTA progress)
+    Dashboard publishes   device/{id}/ota/cmd      (update commands)
+
+  Firmware hosting (.bin files): GitHub Releases or any HTTP/HTTPS URL.
+  Devices pull via HTTPClient on receiving the cmd.
+-->
+<script src="https://unpkg.com/mqtt@5.10.4/dist/mqtt.min.js"></script>
+<style>
+  :root{
+    --bg:#0a0e1a; --panel:#0f1524; --card:#141b2e; --border:#1f2a44;
+    --text:#e6edf7; --mute:#7d8aa8; --accent:#7c5cff; --accent2:#22c4d6;
+    --success:#10b981; --warn:#fbbf24; --err:#ef4444; --info:#3b82f6;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+       background:var(--bg);color:var(--text);min-height:100vh;line-height:1.5;padding:20px}
+  h1{font-size:22px;font-weight:600}
+  h2{font-size:14px;font-weight:600;color:var(--accent2);text-transform:uppercase;
+     letter-spacing:.08em;margin-bottom:14px}
+  .container{max-width:1400px;margin:0 auto}
+  .header{display:flex;align-items:center;justify-content:space-between;
+          background:linear-gradient(135deg,#1a2342 0%,#0f1524 100%);
+          padding:16px 22px;border-radius:14px;margin-bottom:18px;
+          border:1px solid var(--border)}
+  .header .left{display:flex;align-items:center;gap:14px}
+  .header .icon{width:48px;height:48px;background:linear-gradient(135deg,var(--accent),var(--accent2));
+                border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:24px}
+  .header .meta{font-size:12px;color:var(--mute);margin-top:2px}
+  .badge{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;
+         border-radius:999px;font-size:12px;font-weight:600;border:1px solid;background:rgba(0,0,0,.2)}
+  .badge.online{color:var(--success);border-color:var(--success)}
+  .badge.connecting{color:var(--warn);border-color:var(--warn)}
+  .badge.offline{color:var(--err);border-color:var(--err)}
+  .badge .dot{width:8px;height:8px;border-radius:50%;background:currentColor}
+  .grid{display:grid;gap:18px}
+  .grid-2{grid-template-columns:1fr 1fr}
+  @media(max-width:900px){.grid-2{grid-template-columns:1fr}}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px;margin-bottom:18px}
+  .card.purple{border-color:var(--accent)}
+  .card.cyan{border-color:var(--accent2)}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{padding:10px 8px;text-align:left;border-bottom:1px solid var(--border)}
+  th{font-weight:600;color:var(--mute);text-transform:uppercase;font-size:11px;letter-spacing:.05em}
+  td.mono{font-family:'Consolas','Monaco',monospace;font-size:12px}
+  td.online{color:var(--success)}
+  td.stale{color:var(--warn)}
+  td.offline{color:var(--err)}
+  input[type=text],input[type=password],input[type=number],select,textarea{
+    width:100%;padding:10px 12px;background:#0a0e1a;color:var(--text);
+    border:1px solid var(--border);border-radius:8px;font-size:13px;
+    font-family:inherit;outline:none;transition:border-color .15s}
+  input:focus,select:focus,textarea:focus{border-color:var(--accent)}
+  textarea{font-family:'Consolas',monospace;resize:vertical;min-height:80px}
+  label{display:block;font-size:12px;color:var(--mute);margin-bottom:6px;font-weight:500}
+  .row{display:flex;gap:12px;margin-bottom:12px}
+  .row > div{flex:1}
+  button{padding:10px 18px;border:none;border-radius:8px;font-size:13px;font-weight:600;
+         cursor:pointer;font-family:inherit;transition:transform .1s,filter .15s}
+  button:hover:not(:disabled){filter:brightness(1.1)}
+  button:active:not(:disabled){transform:scale(.98)}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  .btn-primary{background:linear-gradient(135deg,var(--accent),var(--accent2));color:white}
+  .btn-secondary{background:var(--panel);color:var(--text);border:1px solid var(--border)}
+  .btn-danger{background:var(--err);color:white}
+  .log{background:#050810;border:1px solid var(--border);border-radius:8px;padding:12px;
+       font-family:'Consolas','Monaco',monospace;font-size:12px;height:340px;overflow-y:auto;line-height:1.6}
+  .log .line{padding:2px 0;border-bottom:1px dashed #15192a}
+  .log .ts{color:var(--mute);margin-right:8px}
+  .log .topic{color:var(--accent2);margin-right:8px}
+  .log .info{color:var(--info)}
+  .log .ok{color:var(--success)}
+  .log .warn{color:var(--warn)}
+  .log .err{color:var(--err)}
+  .toast-host{position:fixed;top:20px;right:20px;display:flex;flex-direction:column;gap:8px;z-index:9999}
+  .toast{padding:12px 18px;border-radius:8px;border:1px solid;font-size:13px;font-weight:500;
+         background:rgba(0,0,0,.85);min-width:240px;max-width:380px;backdrop-filter:blur(10px);
+         animation:slideIn .25s ease-out}
+  @keyframes slideIn{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}
+  .toast.ok{color:var(--success);border-color:var(--success)}
+  .toast.err{color:var(--err);border-color:var(--err)}
+  .toast.info{color:var(--info);border-color:var(--info)}
+  .toast.warn{color:var(--warn);border-color:var(--warn)}
+  .pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:11px;font-weight:600;
+        background:var(--panel);border:1px solid var(--border)}
+  .pill.ok{color:var(--success);border-color:var(--success)}
+  .pill.warn{color:var(--warn);border-color:var(--warn)}
+  .pill.err{color:var(--err);border-color:var(--err)}
+  .stat{padding:12px 14px;background:var(--panel);border:1px solid var(--border);border-radius:10px}
+  .stat .label{font-size:11px;color:var(--mute);text-transform:uppercase;letter-spacing:.05em}
+  .stat .value{font-size:18px;font-weight:600;margin-top:4px}
+  details{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px 16px;margin-bottom:12px}
+  details summary{cursor:pointer;font-weight:600;color:var(--mute);font-size:13px;outline:none}
+  details[open] summary{color:var(--text);margin-bottom:12px}
+  .selected-row{background:rgba(124,92,255,.1)}
+  .help{font-size:11px;color:var(--mute);margin-top:4px}
+</style>
+</head>
+<body>
+
+<div class="toast-host" id="toastHost"></div>
+
+<div class="container">
+
+  <!-- ── Header ─────────────────────────────────────────────────────────── -->
+  <div class="header">
+    <div class="left">
+      <div class="icon">📡</div>
+      <div>
+        <h1>Moldrix FOTA Dashboard</h1>
+        <div class="meta">MQTT Control Plane &middot; <span id="brokerLabel">disconnected</span></div>
+      </div>
+    </div>
+    <div>
+      <span class="badge offline" id="connBadge">
+        <span class="dot"></span><span id="connText">DISCONNECTED</span>
+      </span>
+    </div>
+  </div>
+
+  <!-- ── Settings ───────────────────────────────────────────────────────── -->
+  <details id="settingsCard">
+    <summary>⚙️  Broker Settings</summary>
+    <div class="row">
+      <div>
+        <label>Broker WebSocket URL</label>
+        <input type="text" id="brokerUrl" placeholder="ws://192.168.29.185:15675/ws" />
+        <div class="help">RabbitMQ Web MQTT plugin URL (port 15675). Use laptop IP if accessing remotely.</div>
+      </div>
+      <div>
+        <label>MQTT Username</label>
+        <input type="text" id="brokerUser" />
+      </div>
+      <div>
+        <label>MQTT Password</label>
+        <input type="password" id="brokerPass" />
+      </div>
+    </div>
+    <div class="row" style="align-items:flex-end">
+      <div>
+        <label>Topic Prefix</label>
+        <input type="text" id="topicPrefix" value="device" />
+        <div class="help">Subscribed: <code>{prefix}/+/status</code>, <code>{prefix}/+/ota/status</code></div>
+      </div>
+      <div style="flex:0 0 auto">
+        <button class="btn-primary" id="btnConnect">Connect</button>
+        <button class="btn-secondary" id="btnDisconnect" disabled>Disconnect</button>
+      </div>
+    </div>
+  </details>
+
+  <!-- ── Stats Strip ────────────────────────────────────────────────────── -->
+  <div class="grid grid-2" style="margin-bottom:18px">
+    <div class="grid grid-2">
+      <div class="stat"><div class="label">Devices Online</div><div class="value" id="statOnline">0</div></div>
+      <div class="stat"><div class="label">Devices Total</div><div class="value" id="statTotal">0</div></div>
+    </div>
+    <div class="grid grid-2">
+      <div class="stat"><div class="label">Updates In Progress</div><div class="value" id="statInProgress">0</div></div>
+      <div class="stat"><div class="label">Messages Received</div><div class="value" id="statMsgs">0</div></div>
+    </div>
+  </div>
+
+  <!-- ── Fleet View ─────────────────────────────────────────────────────── -->
+  <div class="card cyan">
+    <h2>📱 Device Fleet</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Device ID</th>
+          <th>Firmware</th>
+          <th>Uptime</th>
+          <th>RSSI</th>
+          <th>Free Heap</th>
+          <th>Last Seen</th>
+          <th>Status</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="fleetTbody">
+        <tr><td colspan="8" style="text-align:center;color:var(--mute);padding:30px">
+          No devices yet — connect broker and wait for heartbeats…
+        </td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- ── Push Update ────────────────────────────────────────────────────── -->
+  <div class="card purple">
+    <h2>🚀 Push Firmware Update</h2>
+    <div class="row">
+      <div>
+        <label>Target Device</label>
+        <select id="targetDevice">
+          <option value="">-- Select device from fleet --</option>
+        </select>
+      </div>
+      <div>
+        <label>New Version Tag</label>
+        <input type="text" id="updateVersion" placeholder="v1.0.3" />
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>Firmware .bin URL (HTTPS recommended)</label>
+        <input type="text" id="updateUrl" placeholder="https://github.com/spubiq/moldrix-fota/releases/download/v1.0.3/firmware.bin" />
+        <div class="help">Where the device should fetch the .bin from. Examples: GitHub Releases, Netlify, your own HTTPS server.</div>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>SHA256 Hash (optional, for integrity verification)</label>
+        <input type="text" id="updateSha256" placeholder="64-char hex hash, or leave empty to skip" />
+      </div>
+    </div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <button class="btn-primary" id="btnPushUpdate">📤 Send Update Command</button>
+      <button class="btn-secondary" id="btnBroadcast">📡 Broadcast to All Devices</button>
+      <button class="btn-danger" id="btnRollback">⏪ Send Rollback Command</button>
+    </div>
+  </div>
+
+  <!-- ── Activity Log ───────────────────────────────────────────────────── -->
+  <div class="card">
+    <h2 style="display:flex;justify-content:space-between;align-items:center">
+      <span>📜 Activity Log</span>
+      <button class="btn-secondary" id="btnClearLog" style="padding:4px 10px;font-size:11px">Clear</button>
+    </h2>
+    <div class="log" id="logEl"></div>
+  </div>
+
+</div>
+
+<script>
+// ═════════════════════════════════════════════════════════════════════════
+//  State
+// ═════════════════════════════════════════════════════════════════════════
+const state = {
+  client: null,
+  connected: false,
+  devices: new Map(),       // deviceId -> {version, uptime, rssi, free_heap, lastSeen, otaPhase, ip}
+  msgCount: 0,
+  prefix: 'device',
+};
+
+const $ = id => document.getElementById(id);
+const fmtBytes = b => b > 1024*1024 ? (b/1024/1024).toFixed(2)+' MB' : (b/1024).toFixed(1)+' KB';
+const fmtUptime = s => {
+  if (!s) return '—';
+  const d = Math.floor(s/86400), h = Math.floor((s%86400)/3600);
+  const m = Math.floor((s%3600)/60), x = s%60;
+  if (d) return `${d}d ${h}h`; if (h) return `${h}h ${m}m`;
+  if (m) return `${m}m ${x}s`; return `${x}s`;
+};
+const fmtAge = ms => {
+  if (!ms) return 'never';
+  const a = Math.floor((Date.now() - ms)/1000);
+  if (a < 60) return `${a}s ago`;
+  if (a < 3600) return `${Math.floor(a/60)}m ago`;
+  return `${Math.floor(a/3600)}h ago`;
+};
+
+// ═════════════════════════════════════════════════════════════════════════
+//  Toasts
+// ═════════════════════════════════════════════════════════════════════════
+function toast(msg, kind='info'){
+  const t = document.createElement('div');
+  t.className = 'toast ' + kind;
+  t.textContent = msg;
+  $('toastHost').appendChild(t);
+  setTimeout(() => t.remove(), 4000);
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  Logger
+// ═════════════════════════════════════════════════════════════════════════
+function log(topic, msg, kind='info'){
+  const ts = new Date().toLocaleTimeString();
+  const line = document.createElement('div');
+  line.className = 'line';
+  line.innerHTML = `<span class="ts">${ts}</span><span class="topic">${topic}</span><span class="${kind}">${msg}</span>`;
+  $('logEl').appendChild(line);
+  $('logEl').scrollTop = $('logEl').scrollHeight;
+  // keep last 200 lines
+  while ($('logEl').children.length > 200) $('logEl').removeChild($('logEl').firstChild);
+}
+
+$('btnClearLog').onclick = () => $('logEl').innerHTML = '';
+
+// ═════════════════════════════════════════════════════════════════════════
+//  Settings persistence
+// ═════════════════════════════════════════════════════════════════════════
+const SETTINGS_KEY = 'moldrix_fota_dash_v1';
+function loadSettings(){
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (!raw) {
+      // sensible defaults
+      $('brokerUrl').value = 'ws://' + window.location.hostname + ':15675/ws';
+      $('brokerUser').value = 'esp32';
+      $('brokerPass').value = 'esp32';
+      return;
+    }
+    const s = JSON.parse(raw);
+    $('brokerUrl').value = s.brokerUrl || 'ws://localhost:15675/ws';
+    $('brokerUser').value = s.brokerUser || 'esp32';
+    $('brokerPass').value = s.brokerPass || 'esp32';
+    $('topicPrefix').value = s.prefix || 'device';
+  } catch (e) {
+    console.warn('settings load failed', e);
+  }
+}
+function saveSettings(){
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify({
+    brokerUrl: $('brokerUrl').value.trim(),
+    brokerUser: $('brokerUser').value.trim(),
+    brokerPass: $('brokerPass').value,
+    prefix: $('topicPrefix').value.trim() || 'device',
+  }));
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  Connection
+// ═════════════════════════════════════════════════════════════════════════
+function setBadge(state, text){
+  $('connBadge').className = 'badge ' + state;
+  $('connText').textContent = text;
+}
+
+function connect(){
+  const url = $('brokerUrl').value.trim();
+  const user = $('brokerUser').value.trim();
+  const pass = $('brokerPass').value;
+  state.prefix = $('topicPrefix').value.trim() || 'device';
+  if (!url){ toast('Broker URL required','err'); return; }
+  saveSettings();
+
+  setBadge('connecting', 'CONNECTING…');
+  $('brokerLabel').textContent = url;
+  log('SYS', `connecting to ${url} as ${user}`, 'info');
+
+  try {
+    state.client = mqtt.connect(url, {
+      username: user, password: pass,
+      clientId: 'moldrix-fota-dash-' + Math.random().toString(16).slice(2),
+      reconnectPeriod: 5000, connectTimeout: 8000,
+    });
+  } catch (e) {
+    log('SYS', 'connect error: ' + e.message, 'err');
+    toast('Connect error: ' + e.message, 'err');
+    setBadge('offline', 'DISCONNECTED');
+    return;
+  }
+
+  state.client.on('connect', () => {
+    state.connected = true;
+    setBadge('online', 'CONNECTED');
+    $('btnConnect').disabled = true;
+    $('btnDisconnect').disabled = false;
+    $('settingsCard').open = false;
+    log('SYS', 'connected ✓', 'ok');
+    toast('Connected to broker', 'ok');
+
+    // subscribe to fleet topics
+    const subs = [
+      `${state.prefix}/+/status`,
+      `${state.prefix}/+/ota/status`,
+    ];
+    subs.forEach(t => {
+      state.client.subscribe(t, { qos: 0 }, err => {
+        if (err) log('SUB', `failed: ${t} (${err.message})`, 'err');
+        else    log('SUB', `subscribed: ${t}`, 'ok');
+      });
+    });
+  });
+
+  state.client.on('reconnect', () => {
+    setBadge('connecting', 'RECONNECTING…');
+    log('SYS', 'reconnecting…', 'warn');
+  });
+
+  state.client.on('close', () => {
+    if (state.connected) log('SYS', 'connection closed', 'warn');
+    state.connected = false;
+    setBadge('offline', 'DISCONNECTED');
+  });
+
+  state.client.on('error', (err) => {
+    log('SYS', 'error: ' + err.message, 'err');
+    toast('MQTT error: ' + err.message, 'err');
+  });
+
+  state.client.on('message', onMessage);
+}
+
+function disconnect(){
+  if (state.client){
+    state.client.end(true);
+    state.client = null;
+  }
+  state.connected = false;
+  setBadge('offline', 'DISCONNECTED');
+  $('btnConnect').disabled = false;
+  $('btnDisconnect').disabled = true;
+  log('SYS', 'disconnected', 'info');
+}
+
+$('btnConnect').onclick = connect;
+$('btnDisconnect').onclick = disconnect;
+
+// ═════════════════════════════════════════════════════════════════════════
+//  Message handler
+// ═════════════════════════════════════════════════════════════════════════
+function onMessage(topic, payload){
+  state.msgCount++;
+  $('statMsgs').textContent = state.msgCount;
+
+  let msg = payload.toString();
+  let json = null;
+  try { json = JSON.parse(msg); } catch(e){ /* not JSON */ }
+
+  // Route by topic pattern: {prefix}/{deviceId}/...
+  const parts = topic.split('/');
+  if (parts.length < 2 || parts[0] !== state.prefix) return;
+  const deviceId = parts[1];
+  const subTopic = parts.slice(2).join('/');
+
+  // Ensure device record exists
+  let dev = state.devices.get(deviceId);
+  if (!dev){
+    dev = { deviceId, lastSeen: 0, otaPhase: '—' };
+    state.devices.set(deviceId, dev);
+  }
+  dev.lastSeen = Date.now();
+
+  if (subTopic === 'status' && json){
+    // Heartbeat from device
+    dev.version = json.version || dev.version;
+    dev.uptime = json.uptime;
+    dev.rssi = json.rssi;
+    dev.free_heap = json.free_heap;
+    dev.ip = json.ip;
+    log(topic, `v${dev.version} | up ${fmtUptime(dev.uptime)} | RSSI ${dev.rssi} | heap ${dev.free_heap?fmtBytes(dev.free_heap):'—'}`, 'info');
+  }
+  else if (subTopic === 'ota/status' && json){
+    dev.otaPhase = json.phase || '—';
+    const cls = (json.phase === 'failed' || json.phase === 'rolled-back') ? 'err'
+              : (json.phase === 'verified' || json.phase === 'success') ? 'ok'
+              : 'warn';
+    log(topic, `OTA: ${json.phase}${json.progress!=null?' '+json.progress+'%':''}${json.message?' — '+json.message:''}`, cls);
+    if (json.phase === 'verified' || json.phase === 'success'){
+      toast(`${deviceId}: update ${json.phase}`, 'ok');
+    }
+    else if (json.phase === 'failed' || json.phase === 'rolled-back'){
+      toast(`${deviceId}: ${json.phase}`, 'err');
+    }
+  }
+  else {
+    log(topic, msg.length > 80 ? msg.slice(0,80)+'…' : msg);
+  }
+
+  renderFleet();
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  Fleet rendering
+// ═════════════════════════════════════════════════════════════════════════
+function renderFleet(){
+  const tbody = $('fleetTbody');
+  const arr = Array.from(state.devices.values()).sort((a,b) => a.deviceId.localeCompare(b.deviceId));
+
+  let online = 0, inProgress = 0;
+  const HEARTBEAT_TIMEOUT_MS = 90000;   // 90s — flag as offline
+
+  if (arr.length === 0){
+    tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;color:var(--mute);padding:30px">
+      No devices yet — connect broker and wait for heartbeats…</td></tr>`;
+  } else {
+    tbody.innerHTML = arr.map(d => {
+      const age = Date.now() - d.lastSeen;
+      const isOnline = age < HEARTBEAT_TIMEOUT_MS;
+      if (isOnline) online++;
+      const inProg = ['downloading','writing','rebooting','booting'].includes(d.otaPhase);
+      if (inProg) inProgress++;
+
+      const statusClass = isOnline ? 'online' : (age < 5*60000 ? 'stale' : 'offline');
+      const statusTxt = isOnline ? 'ONLINE' : (age < 5*60000 ? 'STALE' : 'OFFLINE');
+      const otaPill = (d.otaPhase && d.otaPhase !== '—')
+        ? `<span class="pill ${inProg?'warn':(d.otaPhase==='verified'||d.otaPhase==='success')?'ok':'err'}">${d.otaPhase}</span>`
+        : '<span style="color:var(--mute)">—</span>';
+
+      return `<tr data-id="${d.deviceId}">
+        <td class="mono">${d.deviceId}</td>
+        <td class="mono">${d.version || '—'}</td>
+        <td>${fmtUptime(d.uptime)}</td>
+        <td>${d.rssi != null ? d.rssi + ' dBm' : '—'}</td>
+        <td>${d.free_heap ? fmtBytes(d.free_heap) : '—'}</td>
+        <td>${fmtAge(d.lastSeen)}</td>
+        <td class="${statusClass}">${statusTxt} &nbsp;${otaPill}</td>
+        <td><button class="btn-secondary" style="padding:4px 10px;font-size:11px"
+                onclick="selectDevice('${d.deviceId}')">Select</button></td>
+      </tr>`;
+    }).join('');
+  }
+
+  $('statOnline').textContent = online;
+  $('statTotal').textContent = state.devices.size;
+  $('statInProgress').textContent = inProgress;
+
+  // Update target select
+  const sel = $('targetDevice');
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">-- Select device from fleet --</option>'
+    + arr.map(d => `<option value="${d.deviceId}">${d.deviceId} (v${d.version||'?'}, ${fmtAge(d.lastSeen)})</option>`).join('');
+  if (cur) sel.value = cur;
+}
+
+window.selectDevice = function(id){
+  $('targetDevice').value = id;
+  $('targetDevice').scrollIntoView({behavior:'smooth',block:'center'});
+  toast(`Selected ${id}`, 'info');
+};
+
+// Refresh Last Seen labels every 5s
+setInterval(renderFleet, 5000);
+
+// ═════════════════════════════════════════════════════════════════════════
+//  Push commands
+// ═════════════════════════════════════════════════════════════════════════
+function publishCmd(deviceId, cmdObj){
+  if (!state.connected){ toast('Not connected to broker','err'); return false; }
+  const topic = `${state.prefix}/${deviceId}/ota/cmd`;
+  const payload = JSON.stringify(cmdObj);
+  state.client.publish(topic, payload, { qos: 1 }, err => {
+    if (err){
+      log(topic, 'publish failed: ' + err.message, 'err');
+      toast('Publish failed: ' + err.message, 'err');
+    } else {
+      log(topic, 'PUBLISHED: ' + payload, 'ok');
+    }
+  });
+  return true;
+}
+
+$('btnPushUpdate').onclick = () => {
+  const id = $('targetDevice').value.trim();
+  const url = $('updateUrl').value.trim();
+  const ver = $('updateVersion').value.trim();
+  const sha = $('updateSha256').value.trim();
+  if (!id){ toast('Select target device','err'); return; }
+  if (!url || !/^https?:\/\//i.test(url)){ toast('Valid http(s) URL required','err'); return; }
+  if (!ver){ toast('Version tag required','err'); return; }
+  if (!confirm(`Send update command:\n\nDevice: ${id}\nVersion: ${ver}\nURL: ${url}\n\nProceed?`)) return;
+
+  const cmd = { action: 'update', url, version: ver };
+  if (sha.length === 64) cmd.sha256 = sha.toLowerCase();
+  if (publishCmd(id, cmd)){
+    toast(`Update command sent to ${id}`, 'info');
+  }
+};
+
+$('btnBroadcast').onclick = () => {
+  const url = $('updateUrl').value.trim();
+  const ver = $('updateVersion').value.trim();
+  if (!url || !ver){ toast('URL and version required','err'); return; }
+  if (!confirm(`Broadcast update to ALL ${state.devices.size} devices?\n\nVersion: ${ver}\nURL: ${url}`)) return;
+
+  state.devices.forEach((_, id) => {
+    publishCmd(id, { action: 'update', url, version: ver });
+  });
+  toast(`Broadcasted to ${state.devices.size} devices`, 'info');
+};
+
+$('btnRollback').onclick = () => {
+  const id = $('targetDevice').value.trim();
+  if (!id){ toast('Select target device','err'); return; }
+  if (!confirm(`Send ROLLBACK command to ${id}?\n\nDevice will revert to previous firmware on next boot.`)) return;
+  publishCmd(id, { action: 'rollback' });
+};
+
+// ═════════════════════════════════════════════════════════════════════════
+//  Init
+// ═════════════════════════════════════════════════════════════════════════
+loadSettings();
+log('SYS', 'dashboard ready — click Connect to start', 'info');
+</script>
+</body>
+</html>
