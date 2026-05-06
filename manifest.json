@@ -1,6 +1,6 @@
 {
-  "version": "v1.0.1",
-  "url": "https://CHANGE-ME.netlify.app/firmware.bin",
-  "released_at": "2026-05-04",
-  "notes": "Initial FOTA test release"
+  "version": "v1.0.3",
+  "url": "https://raw.githubusercontent.com/spubiq/fota/main/firmware.bin",
+  "released_at": "2026-05-06",
+  "notes": "ESP32-C3 firmware with MQTT control plane + OTA endpoints"
 }
